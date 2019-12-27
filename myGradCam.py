@@ -171,7 +171,7 @@ def get_args():
     # PS: 还有其他各种的 action, 以及可以去自定义 action
     parser.add_argument("--use-cuda", action="store_true", default=False,
                         help="use cuda acceleration or not")
-    parser.add_argument("--image-path", type=str, default="/home/suilin/codes/mmdetection/data/VOCdevkit/VOC2007/JPEGImages/000001.jpg")
+    parser.add_argument("--image-path", type=str, default="")
     parser.add_argument("--category", type=int, default=None)
     args = parser.parse_args()
     args.use_cuda = args.use_cuda and torch.cuda.is_available()
