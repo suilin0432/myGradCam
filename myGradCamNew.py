@@ -53,10 +53,12 @@ class FeatureExtractor(object):
     def __call__(self, input):
         # 开始进行前向传播了
         self.gradients = []
+        # print(input)
         # 获取到所有想要的信息
-        inputList, sourceList, edResultList, cls_score, bbox_pred, \
-        loss_index, loss_index_original, scores, bboxes, featureMaps, \
-        img, img_meta, bbox_results, bbox_results_original = self.model.visual_forward(**input)
+        # inputList, sourceList, edResultList, cls_score, bbox_pred, \
+        # loss_index, loss_index_original, scores, bboxes, featureMaps, \
+        # img, img_meta, bbox_results, bbox_results_original = self.model(**input)
+        scores, bboxes, featureMaps, bbox_feats = self.model(**input)
         # 要为model的FPN的输出, !!!注意是输出!!! 加上hook
         for layer in featureMaps:
             layer.register_hook(self.save_gradient)
@@ -108,12 +110,11 @@ class GradCam(object):
     # selectProposalIndex 是想要选择的proposal的index... 用来多次调用的时候避免随机化的出现
     def __call__(self, input, index = None, selectProposalIndex=None):
         assert selectProposalIndex == None or len(selectProposalIndex) >= 4
+        img_meta = input["img_meta"][0].data[0][0]
         if self.cuda:
-            input["img"] = input["img"].cuda()
-            input["img_meta"] = input["img_meta"].cuda()
+            input["img"][0] = input["img"][0].cuda()
         else:
-            input["img"] = input["img"].cpu()
-            input["img_meta"] = input["img_meta"].cpu()
+            input["img"][0] = input["img"][0].cpu()
         """
         从 extractor 获取到的信息
         featuresMaps: tuple() -> length:4 分别是 stage1 - stage4的 feature Map
@@ -123,86 +124,98 @@ class GradCam(object):
         bboxes: torch.Size([4, 1000, 84]) -> torch.Size([4, 1000, 21, 4])
         scores: torch.Size([4, 1000, 21])
         """
-        featureMaps, bboxes, scores = self.extractor(input)
-        maxValue, maxIndex = torch.max(scores, 2)
-        camList = []
+        if self.targetOutput == "classification":
+            featureMaps, bboxes, scores = self.extractor(input)
+            maxValue, maxIndex = torch.max(scores, 2)
+            camList = []
+            bboxes = bboxes.view(bboxes.size(0), bboxes.size(1), -1, 4)
 
 
-        # 我们会选择出来2个背景和2个前景进行特征的获取
-        if selectProposalIndex:
-            paintIndex = selectProposalIndex[:4]
-        else:
-            shuffleIndex = [i for i in range(bboxes.size(1))]
-            np.random.shuffle(shuffleIndex)
-            paintIndex = []
-            fgCount = 0
-            bgCount = 0
-            for index in shuffleIndex:
-                if bgCount < 2 and torch.sum(maxIndex[:, index]) == 0:
-                    bgCount += 1
-                    paintIndex.append(index)
-                elif fgCount < 2 and torch.sum(maxIndex[:, index]) != 0:
-                    fgCount += 1
-                    paintIndex.append(fgCount)
-                else:
-                    break
-            assert len(paintIndex) == 4
-        currentIndex = -1
-        # 对每个选择出来的 proposal 进行处理
-        for instanceIndex in paintIndex:
-            currentIndex += 1
-            # 清空梯度信息
-            self.extractor.clean_gradients()
+            # 我们会选择出来2个背景和2个前景进行特征的获取
+            if selectProposalIndex:
+                paintIndex = selectProposalIndex[:4]
+            else:
+                shuffleIndex = [i for i in range(bboxes.size(1))]
+                np.random.shuffle(shuffleIndex)
+                paintIndex = []
+                fgCount = 0
+                bgCount = 0
+                # print(maxIndex.shape)
+                for sindex in shuffleIndex:
+                    if bgCount < 2 and torch.sum(maxIndex[:, sindex]) == 0:
+                        bgCount += 1
+                        paintIndex.append(sindex)
+                    elif fgCount < 2 and torch.sum(maxIndex[:, sindex]) != 0:
+                        fgCount += 1
+                        paintIndex.append(fgCount)
+                    elif fgCount+bgCount >= 4:
+                        break
+                assert len(paintIndex) <= 4
+            print(paintIndex, "fgCount: {}  bgCount: {}".format(fgCount, bgCount))
+            currentIndex = -1
+            # 对每个选择出来的 proposal 进行处理
+            for instanceIndex in paintIndex:
+                print("deal with {}".format(instanceIndex))
+                currentIndex += 1
+                # 清空梯度信息
+                self.extractor.clean_gradients()
 
-            self.camList.append([])
-            # 要一个阶段一个阶段的处理
-            for stageIndex in range(4):
-                # 清空该阶段feature map的梯度信息
-                featureMaps[stageIndex].grad = None
+                camList.append([])
+                # 要一个阶段一个阶段的处理
+                for stageIndex in range(4):
+                    # 清空该阶段feature map的梯度信息
+                    featureMaps[stageIndex].grad = None
 
-                if index == None:
-                    index = maxIndex[stageIndex, instanceIndex]
-                bbox = bboxes[stageIndex, instanceIndex, index]
-                score = scores[stageIndex, index]
+                    if index == None:
+                        index_ = maxIndex[stageIndex, instanceIndex]
+                    else:
+                        index_ = index
+                    bbox = bboxes[stageIndex, instanceIndex, index_]
+                    score = scores[stageIndex, instanceIndex, index_]
 
-                one_hot = torch.zeros((1, scores.shape[-1]), dtype=torch.float32).requires_grad_(True)
-                one_hot[0][index] = 1
-                if self.cuda:
-                    one_hot = torch.sum(one_hot.cuda() * scores[stageIndex][instanceIndex])
-                else:
-                    one_hot = torch.sum(one_hot * scores[stageIndex][instanceIndex])
-                # 清空模型所有阶段的梯度信息
-                for name, module in self.model._modules.items():
-                    module.zero_grad()
-                # 进行反向传播, 这个时候 extractor 中的梯度信息数组就已经记录信息了, 下次的时候要将这个数组清空之后再进行反传
-                one_hot.backward(retain_graph=True)
-                # 获取grads_val
-                grads_val = self.extractor.get_gradients()[-1].cpu().data.numpy()
-                # 获取目标 feature map
-                target = featureMaps[stageIndex]
-                target = target.cpu().data.numpy()
-                # 进行平均池化处理
-                weights = np.mean(grads_val, axis=(2, 3))[0, :]
+                    # 这里 one_hot 用了什么 inplace 操作... 不能进行反向传播
+                    # one_hot = torch.zeros((1, scores.shape[-1]), dtype=torch.float32).requires_grad_(True)
+                    # one_hot[0][index] = 1
+                    # if self.cuda:
+                    #     one_hot = torch.sum(one_hot.cuda() * scores[stageIndex][instanceIndex])
+                    # else:
+                    #     one_hot = torch.sum(one_hot * scores[stageIndex][instanceIndex])
+                    # 清空模型所有阶段的梯度信息
+                    for name, module in self.model.module._modules.items():
+                        module.zero_grad()
+                    # 进行反向传播, 这个时候 extractor 中的梯度信息数组就已经记录信息了, 下次的时候要将这个数组清空之后再进行反传
+                    score.backward(retain_graph=True)
+                    # print(one_hot.grad_fn)
+                    # one_hot.backward(retain_graph=True)
+                    # 获取grads_val
+                    grads_val = self.extractor.get_gradients()[-1].cpu().data.numpy()
+                    # 获取目标 feature map
+                    target = featureMaps[stageIndex]
+                    target = target.cpu().data.numpy()
+                    # 进行平均池化处理
+                    weights = np.mean(grads_val, axis=(2, 3))[0, :]
 
-                cam = np.zeros(target.shape[1:], dtype=np.float32)
+                    cam = np.zeros(target.shape[2:], dtype=np.float32)
 
-                for i, w in enumerate(weights):
-                    cam += w * target[i, :, :]
+                    for i, w in enumerate(weights):
+                        cam += w * target[0, i, :, :]
 
-                cam = np.maximum(cam, 0)
-                cam = cv2.resize(cam, (224, 224))  # 调整图片尺寸 PS: 这里也是要修改的, 因为实际上要调整到目标尺寸大小的
-                # 进行归一化处理(为了可视化的时候是 0-255(也就是 float 上的 0-1)的)
-                cam = cam - np.min(cam)
-                cam = cam / np.max(cam)
-                # 添加camDict到camList中
-                camDict = {
-                    "proposal_index: ": instanceIndex,
-                    "cam": cam,
-                    "bbox": bbox
-                }
-                camList[currentIndex].append(camDict)
+                    cam = np.maximum(cam, 0)
+                    # print(instanceIndex, stageIndex, cam, "\n\n\n")
+                    cam = cv2.resize(cam, (img_meta["pad_shape"][1], img_meta["pad_shape"][0]))  # 调整图片尺寸 PS: 这里也是要修改的, 因为实际上要调整到目标尺寸大小的
+                    # 进行归一化处理(为了可视化的时候是 0-255(也就是 float 上的 0-1)的)
+                    cam = cam - np.min(cam)
+                    cam = cam / (np.max(cam)+1e-16)
+                    # 添加camDict到camList中
+                    camDict = {
+                        "proposal_index": instanceIndex,
+                        "cam": cam,
+                        "bbox": bbox,
+                        "category": index_
+                    }
+                    camList[currentIndex].append(camDict)
 
-        return camList
+            return camList
 
 # 进行命令行输入参数的解析
 def get_args():
@@ -260,11 +273,13 @@ def modelInit(configPath, checkPointPath):
         model.CLASSES = checkpoint['meta']['CLASSES']
     else:
         model.CLASSES = dataset.CLASSES
-
+    model = MMDataParallel(model, device_ids=[0])
+    model.eval()
     return model, dataset, data_loader
 
 # 进行图片的获取
 def img_message_get(dataloader, index=-1):
+    # index = 0
     if index < 0:
         index = np.random.randint(0, 4000)
     for i, data in enumerate(dataloader):
@@ -276,8 +291,11 @@ def img_message_get(dataloader, index=-1):
         return data
 
 # 存储 grad-cam 图
-def savemaskList(input, maskList):
-    img_meta = input["img_meta"]
+def savemaskList(input, maskList, CLS):
+    # print(maskList)
+    CLS = list(CLS)
+    CLS.insert(0, "background")
+    img_meta = input["img_meta"][0].data[0][0]
     # 首先进行图片的读取
     imgPath = img_meta["filename"]
     img = mmcv.imread(imgPath)
@@ -290,18 +308,23 @@ def savemaskList(input, maskList):
             cam = maskDict["cam"]
             bbox = maskDict["bbox"]
             proposal_index = maskDict["proposal_index"]
+            category = maskDict["category"]
             # 画一个 anchor...
             x1, y1, x2, y2 = bbox
             left_top = (int(x1), int(y1))
             right_bottom = (int(x2), int(y2))
-            heatmap = cv2.applyColorMap(np.uint8(255*cam), cv2.COLORMAP_JET)
-            heatmap = np.float32(heatmap) / 255
-            cam = heatmap + np.float32(img)
-            cam = cam / np.max(cam)
-            cv2.rectangle(
-                cam, left_top, right_bottom, (0, 0, 255), thickness=1)
-            cv2.imwrite("cam_{}_{}.jpg".format(proposal_index, stageIndex), np.uint8(255*cam))
+            # print(cam.shape)
 
+            heatmap = cv2.applyColorMap(np.uint8(255*cam), cv2.COLORMAP_JET)
+            # cv2.imwrite("heatmap_{}_{}_{}.jpg".format(proposal_index, stageIndex, CLS[category]), heatmap)
+            heatmap = np.float32(heatmap) / 255
+            # print(np.sum(heatmap))
+            cam = heatmap + np.float32(img/255)
+            cam = cam / np.max(cam)
+            cam = np.uint8(cam*255)
+            cv2.rectangle(
+                cam, left_top, right_bottom, color=(0, 0, 255), thickness=1)
+            cv2.imwrite("cam_{}_{}_{}.jpg".format(proposal_index, stageIndex, CLS[category]), cam)
 # 主题流程
 if __name__ == "__main__":
     """
@@ -316,24 +339,27 @@ if __name__ == "__main__":
     args = get_args()
 
     # 初始化各个参数
-    os.environ["CUDA_VISIBLE_DEVICES"] = '2'
-    configPath = "/home/suilin/codes/mmdetection/myCfgs/myDN8.py"
-    checkPointPath = "/data2/suilin/myDN8/epoch_15.pth"
+    os.environ["CUDA_VISIBLE_DEVICES"] = '4'
+    configPath = "/home/suilin/codes/mmdetection/myCfgs/myDN12.py"
+    checkPointPath = "/data2/suilin/myDN12/epoch_18.pth"
+    target = "classification"
 
     # 加载想要的模型(这里用函数封装一下吧)
     model, dataset, dataloader = modelInit(configPath, checkPointPath)
 
     # 使用 GradCam 类进行上面模型的封装, 添加hook等信息方便获取到指定的 feature map 等
     # 信息去进行可视化
-    grad_cam = GradCam(model=model, use_cuda=args.use_cuda)
+    grad_cam = GradCam(model=model, use_cuda=args.use_cuda, targetOutput=target)
 
     # 进行图片信息的处理:
     # 这里选择直接用 dataloader 进行图片的提取就好了... 不想太费劲了...
     data = img_message_get(dataloader)
 
     input = {
-        "messageType":"all",
-        **data
+        "messageType":"gradCam",
+		"return_loss": False,
+		"see": True,
+		**data
     }
 
     # 想要使用的类别
@@ -342,4 +368,4 @@ if __name__ == "__main__":
     # 到此 grad_cam 已经获得了, 后面要进行的其实是 guided grad-cam 的相关信息的获取(也就是论文中提到的fine-grand的信息图)
     maskList = grad_cam(input, target_index)
     # 进行图片的保存
-    savemaskList(input, maskList)
+    savemaskList(input, maskList, model.module.CLASSES)
